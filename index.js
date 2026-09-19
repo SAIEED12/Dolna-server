@@ -30,13 +30,24 @@ async function run() {
     app.post('/add-products', async (req, res) => {
       try {
         const product = req.body;
-        const result = await productsCollection.insertOne(product);
+        const result = await productsCollection.insertOne({...product, price: Number(product.price), stock: Number(product.stock)});
         res.status(201).json(result);
       } catch (error) {
         console.error("Error adding product:", error);
         res.status(500).json({ error: "Failed to add product" });
       }
     });
+
+    //Get Products API
+    app.get('/products', async (req, res) => {
+      try {
+        const products = await productsCollection.find().toArray();
+        res.status(200).json(products);
+      } catch (error) {
+        console.error("Error fetching products:", error);
+        res.status(500).json({ error: "Failed to fetch products" });
+      }
+    })
 
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
