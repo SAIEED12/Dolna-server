@@ -5,7 +5,7 @@ const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
 dotenv.config();
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId  } = require('mongodb');
 const uri = process.env.MONGODB_URI;
 const app = express();
 app.use(cors());
@@ -38,6 +38,7 @@ async function run() {
       }
     });
 
+
     //Get Products API
     app.get('/products', async (req, res) => {
       try {
@@ -48,6 +49,14 @@ async function run() {
         res.status(500).json({ error: "Failed to fetch products" });
       }
     })
+
+   //Prodducts Details API
+    app.get('/products/:id', async (req, res) => {
+      const {id} = req.params;
+      const result = await productsCollection.findOne({_id: new ObjectId(id)});
+      res.send(result);
+    })
+
 
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
