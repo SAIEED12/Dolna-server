@@ -12,6 +12,28 @@ app.use(cors());
 app.use(express.json());
 const port = process.env.port || 5000;
 
+const MAX_IMAGES = 4;
+
+const isValidUrl = (value) => {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const { protocol } = new URL(value.trim());
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+//Image Handler
+const validateImages = (images) => {
+  if (!Array.isArray(images)) return "images must be an array of URLs";
+  if (images.length < 1 || images.length > MAX_IMAGES) {
+    return `images must contain between 1 and ${MAX_IMAGES} URLs`;
+  }
+  if (!images.every(isValidUrl)) return "every item in images must be a valid http(s) URL";
+  return null;
+};
+
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -30,7 +52,23 @@ async function run() {
     app.post('/add-products', async (req, res) => {
       try {
         const product = req.body;
-        const result = await productsCollection.insertOne({...product, price: Number(product.price), stock: Number(product.stock)});
+
+        const imagesError = validateImages(product.images);
+        if (imagesError) {
+          return res.status(400).json({ error: imagesError });
+        }
+
+        const images = product.images.map((url) => url.trim());
+        // Cover image
+        const image = isValidUrl(product.image) ? product.image.trim() : images[0];
+
+        const result = await productsCollection.insertOne({
+          ...product,
+          image,
+          images,
+          price: Number(product.price),
+          stock: Number(product.stock),
+        });
         res.status(201).json(result);
       } catch (error) {
         console.error("Error adding product:", error);
@@ -50,11 +88,22 @@ async function run() {
       }
     })
 
-   //Prodducts Details API
+   //Products Details API
     app.get('/products/:id', async (req, res) => {
-      const {id} = req.params;
-      const result = await productsCollection.findOne({_id: new ObjectId(id)});
-      res.send(result);
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: "Invalid product id" });
+        }
+        const result = await productsCollection.findOne({ _id: new ObjectId(id) });
+        if (!result) {
+          return res.status(404).json({ error: "Product not found" });
+        }
+        res.status(200).json(result);
+      } catch (error) {
+        console.error("Error fetching product:", error);
+        res.status(500).json({ error: "Failed to fetch product" });
+      }
     })
 
 
