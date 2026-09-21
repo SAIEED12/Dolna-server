@@ -106,6 +106,99 @@ async function run() {
       }
     })
 
+    //Update Product API
+    app.patch('/products/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: "Invalid product id" });
+        }
+        if (!req.body || Object.keys(req.body).length === 0) {
+          return res.status(400).json({ error: "No fields to update" });
+        }
+
+        const { _id, ...fields } = req.body;
+        const updateDoc = {};
+
+        if ('images' in fields) {
+          const imagesError = validateImages(fields.images);
+          if (imagesError) {
+            return res.status(400).json({ error: imagesError });
+          }
+          const images = fields.images.map((url) => url.trim());
+          updateDoc.images = images;
+          if ('image' in fields && isValidUrl(fields.image)) {
+            updateDoc.image = fields.image.trim();
+          } else {
+            updateDoc.image = images[0];
+          }
+        } else if ('image' in fields) {
+          if (!isValidUrl(fields.image)) {
+            return res.status(400).json({ error: "image must be a valid http(s) URL" });
+          }
+          updateDoc.image = fields.image.trim();
+        }
+
+        if ('price' in fields) {
+          const price = Number(fields.price);
+          if (Number.isNaN(price)) {
+            return res.status(400).json({ error: "price must be a valid number" });
+          }
+          updateDoc.price = price;
+        }
+
+        if ('stock' in fields) {
+          const stock = Number(fields.stock);
+          if (Number.isNaN(stock)) {
+            return res.status(400).json({ error: "stock must be a valid number" });
+          }
+          updateDoc.stock = stock;
+        }
+
+        for (const [key, value] of Object.entries(fields)) {
+          if (['_id', 'image', 'images', 'price', 'stock'].includes(key)) continue;
+          updateDoc[key] = value;
+        }
+
+        if (Object.keys(updateDoc).length === 0) {
+          return res.status(400).json({ error: "No fields to update" });
+        }
+        updateDoc.updatedAt = new Date();
+
+        const result = await productsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateDoc }
+        );
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: "Product not found" });
+        }
+
+        const updated = await productsCollection.findOne({ _id: new ObjectId(id) });
+        res.status(200).json(updated);
+      } catch (error) {
+        console.error("Error updating product:", error);
+        res.status(500).json({ error: "Failed to update product" });
+      }
+    })
+
+    //Delete Product API
+    app.delete('/products/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: "Invalid product id" });
+        }
+        const result = await productsCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: "Product not found" });
+        }
+        res.status(200).json({ success: true, deletedId: id, deletedCount: result.deletedCount });
+      } catch (error) {
+        console.error("Error deleting product:", error);
+        res.status(500).json({ error: "Failed to delete product" });
+      }
+    })
+
 
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
