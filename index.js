@@ -14,6 +14,8 @@ const port = process.env.port || 5000;
 
 const MAX_IMAGES = 4;
 const DEFAULT_DELIVERY_CHARGE = 60;
+const ORDER_STATUSES = ["pending", "confirmed", "shipped", "delivered", "cancelled"];
+const FINAL_ORDER_STATUSES = ["delivered", "cancelled"];
 
 const isValidUrl = (value) => {
   if (typeof value !== "string" || !value.trim()) return false;
@@ -115,6 +117,107 @@ const validateOrder = (body) => {
       note,
     },
   };
+};
+
+//Partial validator for PATCH /orders/:id (Option B: keep old unitPrice)
+const validateOrderPatch = (body) => {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "order update body must be an object" };
+  }
+
+  const IMMUTABLE = ["_id", "paymentMethod", "totalAmount", "subtotal", "itemCount", "createdAt"];
+  for (const key of IMMUTABLE) {
+    if (key in body) {
+      return { error: `${key} cannot be updated` };
+    }
+  }
+
+  const value = {};
+  let hasField = false;
+
+  if ("customer" in body) {
+    const customer = body.customer;
+    if (!customer || typeof customer !== "object" || Array.isArray(customer)) {
+      return { error: "customer must be an object { name?, phone?, address? }" };
+    }
+    const patch = {};
+    for (const key of ["name", "phone", "address"]) {
+      if (key in customer) {
+        if (typeof customer[key] !== "string" || !customer[key].trim()) {
+          return { error: `customer.${key} must be a non-empty string` };
+        }
+        patch[key] = customer[key].trim();
+      }
+    }
+    if (Object.keys(patch).length === 0) {
+      return { error: "customer must contain at least one of name, phone, address" };
+    }
+    value.customer = patch;
+    hasField = true;
+  }
+
+  if ("note" in body) {
+    if (typeof body.note !== "string") {
+      return { error: "note must be a string" };
+    }
+    const note = body.note.trim();
+    if (note.length > 500) {
+      return { error: "note must be at most 500 characters" };
+    }
+    value.note = note;
+    hasField = true;
+  }
+
+  if ("deliveryCharge" in body) {
+    const deliveryCharge = Number(body.deliveryCharge);
+    if (!Number.isFinite(deliveryCharge) || deliveryCharge < 0) {
+      return { error: "deliveryCharge must be a number >= 0" };
+    }
+    value.deliveryCharge = deliveryCharge;
+    hasField = true;
+  }
+
+  if ("orderStatus" in body) {
+    const orderStatus = typeof body.orderStatus === "string" ? body.orderStatus.trim().toLowerCase() : "";
+    if (!ORDER_STATUSES.includes(orderStatus)) {
+      return { error: `orderStatus must be one of: ${ORDER_STATUSES.join(", ")}` };
+    }
+    value.orderStatus = orderStatus;
+    hasField = true;
+  }
+
+  if ("items" in body) {
+    if (!Array.isArray(body.items) || body.items.length === 0) {
+      return { error: "items must be a non-empty array of { productId, quantity }" };
+    }
+    const seen = new Set();
+    const items = [];
+    for (const entry of body.items) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return { error: "each item must be an object { productId, quantity }" };
+      }
+      const productId = typeof entry.productId === "string" ? entry.productId.trim() : "";
+      if (!ObjectId.isValid(productId)) {
+        return { error: `invalid productId: ${entry.productId}` };
+      }
+      if (seen.has(productId)) {
+        return { error: `duplicate productId: ${productId}` };
+      }
+      seen.add(productId);
+      const quantity = Number(entry.quantity);
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        return { error: `quantity for product ${productId} must be a positive integer` };
+      }
+      items.push({ productId, quantity });
+    }
+    value.items = items;
+    hasField = true;
+  }
+
+  if (!hasField) {
+    return { error: "No fields to update" };
+  }
+  return { value };
 };
 
 const client = new MongoClient(uri, {
@@ -383,6 +486,185 @@ async function run() {
       } catch (error) {
         console.error("Error fetching orders:", error);
         res.status(500).json({ error: "Failed to fetch orders" });
+      }
+    });
+
+    //Update Order API
+    app.patch('/orders/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: "Invalid order id" });
+        }
+        const { error, value } = validateOrderPatch(req.body);
+        if (error) {
+          return res.status(400).json({ error });
+        }
+
+        const existing = await ordersCollection.findOne({ _id: new ObjectId(id) });
+        if (!existing) {
+          return res.status(404).json({ error: "Order not found" });
+        }
+
+        const isFinal = FINAL_ORDER_STATUSES.includes(existing.orderStatus);
+        const wantsDataChange = ("customer" in value) || ("note" in value) || ("deliveryCharge" in value) || ("items" in value);
+        if (isFinal && wantsDataChange) {
+          return res.status(400).json({ error: `Order is ${existing.orderStatus} and cannot be edited` });
+        }
+        if (existing.orderStatus === "delivered" && value.orderStatus === "cancelled") {
+          return res.status(400).json({ error: "Delivered order cannot be cancelled" });
+        }
+
+        const newStatus = value.orderStatus || existing.orderStatus;
+        const newDeliveryCharge = ("deliveryCharge" in value) ? value.deliveryCharge : existing.deliveryCharge;
+        const newCustomer = ("customer" in value) ? { ...existing.customer, ...value.customer } : existing.customer;
+        const newNote = ("note" in value) ? value.note : (existing.note || "");
+
+        //keep old unitPrice, new products use DB price
+        let finalItems = existing.items;
+        if ("items" in value) {
+          const oldMap = new Map((existing.items || []).map((it) => [
+            it.productId.toString(),
+            { quantity: it.quantity, unitPrice: it.unitPrice, title: it.title, image: it.image },
+          ]));
+          const newIds = value.items.map((it) => new ObjectId(it.productId));
+          const products = await productsCollection.find({ _id: { $in: newIds } }).toArray();
+          const productById = new Map(products.map((p) => [p._id.toString(), p]));
+
+          for (const it of value.items) {
+            if (!oldMap.has(it.productId) && !productById.has(it.productId)) {
+              return res.status(404).json({ error: `Product not found: ${it.productId}` });
+            }
+          }
+
+          finalItems = value.items.map((it) => {
+            if (oldMap.has(it.productId)) {
+              const old = oldMap.get(it.productId);
+              return {
+                productId: new ObjectId(it.productId),
+                title: old.title || "",
+                image: old.image || "",
+                unitPrice: old.unitPrice,
+                quantity: it.quantity,
+                subtotal: old.unitPrice * it.quantity,
+              };
+            }
+            const product = productById.get(it.productId);
+            const unitPrice = Number(product.price);
+            return {
+              productId: new ObjectId(it.productId),
+              title: product.title || product.name || "",
+              image: product.image || "",
+              unitPrice,
+              quantity: it.quantity,
+              subtotal: unitPrice * it.quantity,
+            };
+          });
+        }
+
+        const subtotal = finalItems.reduce((sum, it) => sum + it.subtotal, 0);
+        const itemCount = finalItems.reduce((sum, it) => sum + it.quantity, 0);
+        const totalAmount = subtotal + newDeliveryCharge;
+
+        // Stock adjustments
+        const oldQty = new Map((existing.items || []).map((it) => [it.productId.toString(), it.quantity]));
+        const newQty = new Map(finalItems.map((it) => [it.productId.toString(), it.quantity]));
+        const isCancelling = existing.orderStatus !== "cancelled" && newStatus === "cancelled";
+        const isReopening = existing.orderStatus === "cancelled" && newStatus !== "cancelled";
+
+        const deltas = new Map();
+        if ("items" in value && !isCancelling && !isReopening) {
+          const allIds = new Set([...oldQty.keys(), ...newQty.keys()]);
+          for (const pid of allIds) {
+            const d = (newQty.get(pid) || 0) - (oldQty.get(pid) || 0);
+            if (d !== 0) deltas.set(pid, d);
+          }
+        }
+
+        const session = client.startSession();
+        try {
+          await session.withTransaction(async () => {
+            if (!isCancelling) {
+              const needCheck = isReopening
+                ? [...newQty.entries()]
+                : [...deltas.entries()].filter(([, d]) => d > 0).map(([pid, d]) => [pid, d]);
+              for (const [pid, need] of needCheck) {
+                const qtyNeeded = isReopening ? need : need;
+                const prod = await productsCollection.findOne({ _id: new ObjectId(pid) }, { session });
+                if (!prod) throw new Error(`Product not found: ${pid}`);
+                if (!Number.isFinite(Number(prod.stock)) || Number(prod.stock) < qtyNeeded) {
+                  throw new Error(`Insufficient stock for product: ${pid}`);
+                }
+              }
+            }
+
+            await ordersCollection.updateOne(
+              { _id: new ObjectId(id) },
+              {
+                $set: {
+                  customer: newCustomer,
+                  items: finalItems,
+                  itemCount,
+                  subtotal,
+                  deliveryCharge: newDeliveryCharge,
+                  totalAmount,
+                  orderStatus: newStatus,
+                  note: newNote,
+                  updatedAt: new Date(),
+                },
+              },
+              { session }
+            );
+
+            if (isCancelling) {
+              for (const [pid, qty] of oldQty.entries()) {
+                await productsCollection.updateOne(
+                  { _id: new ObjectId(pid) },
+                  { $inc: { stock: qty }, $set: { updatedAt: new Date() } },
+                  { session }
+                );
+              }
+            } else if (isReopening) {
+              for (const [pid, qty] of newQty.entries()) {
+                const r = await productsCollection.updateOne(
+                  { _id: new ObjectId(pid), stock: { $gte: qty } },
+                  { $inc: { stock: -qty }, $set: { updatedAt: new Date() } },
+                  { session }
+                );
+                if (r.matchedCount === 0) throw new Error(`Insufficient stock for product: ${pid}`);
+              }
+            } else {
+              for (const [pid, d] of deltas.entries()) {
+                if (d > 0) {
+                  const r = await productsCollection.updateOne(
+                    { _id: new ObjectId(pid), stock: { $gte: d } },
+                    { $inc: { stock: -d }, $set: { updatedAt: new Date() } },
+                    { session }
+                  );
+                  if (r.matchedCount === 0) throw new Error(`Insufficient stock for product: ${pid}`);
+                } else {
+                  await productsCollection.updateOne(
+                    { _id: new ObjectId(pid) },
+                    { $inc: { stock: -d }, $set: { updatedAt: new Date() } },
+                    { session }
+                  );
+                }
+              }
+            }
+          });
+
+          const updated = await ordersCollection.findOne({ _id: new ObjectId(id) });
+          res.status(200).json(updated);
+        } finally {
+          await session.endSession();
+        }
+      } catch (err) {
+        if (err.message && (err.message.startsWith("Insufficient stock") || err.message.startsWith("Product not found"))) {
+          const code = err.message.startsWith("Product not found") ? 404 : 400;
+          return res.status(code).json({ error: err.message });
+        }
+        console.error("Error updating order:", err);
+        res.status(500).json({ error: "Failed to update order" });
       }
     });
 
