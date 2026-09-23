@@ -108,6 +108,14 @@ const validateOrder = (body) => {
     }
   }
 
+  let userId = null;
+  if (body.userId !== undefined && body.userId !== null) {
+    userId = normalizeUserId(body.userId);
+    if (!userId) {
+      return { error: "userId must be a non-empty string" };
+    }
+  }
+
   return {
     value: {
       customer: { name, phone, address },
@@ -115,17 +123,17 @@ const validateOrder = (body) => {
       paymentMethod,
       deliveryCharge,
       note,
+      userId,
     },
   };
 };
 
-//Partial validator for PATCH /orders/:id (Option B: keep old unitPrice)
 const validateOrderPatch = (body) => {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { error: "order update body must be an object" };
   }
 
-  const IMMUTABLE = ["_id", "paymentMethod", "totalAmount", "subtotal", "itemCount", "createdAt"];
+  const IMMUTABLE = ["_id", "userId", "paymentMethod", "totalAmount", "subtotal", "itemCount", "createdAt"];
   for (const key of IMMUTABLE) {
     if (key in body) {
       return { error: `${key} cannot be updated` };
@@ -220,6 +228,38 @@ const validateOrderPatch = (body) => {
   return { value };
 };
 
+const MAX_WISHLIST_ITEMS = 200;
+
+const normalizeUserId = (raw) => {
+  const id = typeof raw === "string" ? raw.trim() : "";
+  return id.length > 0 && id.length <= 128 ? id : null;
+};
+
+//Wishlist Handler
+const validateWishlistIds = (ids, { allowEmpty = true } = {}) => {
+  if (!Array.isArray(ids)) {
+    return { error: "productIds must be an array of product ids" };
+  }
+  if (!allowEmpty && ids.length === 0) {
+    return { error: "productIds must be a non-empty array" };
+  }
+  if (ids.length > MAX_WISHLIST_ITEMS) {
+    return { error: `wishlist can hold at most ${MAX_WISHLIST_ITEMS} items` };
+  }
+  const seen = new Set();
+  const clean = [];
+  for (const entry of ids) {
+    const productId = typeof entry === "string" ? entry.trim() : "";
+    if (!ObjectId.isValid(productId)) {
+      return { error: `invalid productId: ${entry}` };
+    }
+    if (seen.has(productId)) continue;
+    seen.add(productId);
+    clean.push(productId);
+  }
+  return { value: clean };
+};
+
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -234,6 +274,9 @@ async function run() {
     const db = client.db("dolna_db");
     const productsCollection = db.collection("products");
     const ordersCollection = db.collection("orders");
+    const wishlistsCollection = db.collection("wishlists");
+    await wishlistsCollection.createIndex({ userId: 1 }, { unique: true });
+    await ordersCollection.createIndex({ userId: 1 });
 
     //Add Products API
     app.post('/add-products', async (req, res) => {
@@ -429,6 +472,7 @@ async function run() {
         const now = new Date();
         const orderDoc = {
           customer: value.customer,
+          userId: value.userId,
           items: orderItems,
           itemCount: orderItems.reduce((sum, item) => sum + item.quantity, 0),
           subtotal,
@@ -480,6 +524,13 @@ async function run() {
         const filter = {};
         if (req.query.phone) {
           filter["customer.phone"] = String(req.query.phone).trim();
+        }
+        if (req.query.userId) {
+          const userId = normalizeUserId(req.query.userId);
+          if (!userId) {
+            return res.status(400).json({ error: "Invalid user id" });
+          }
+          filter.userId = userId;
         }
         const orders = await ordersCollection.find(filter).sort({ createdAt: -1 }).toArray();
         res.status(200).json(orders);
@@ -686,6 +737,161 @@ async function run() {
       }
     })
 
+    //Wishlist APIs 
+    app.get('/wishlist/:userId', async (req, res) => {
+      try {
+        const userId = normalizeUserId(req.params.userId);
+        if (!userId) {
+          return res.status(400).json({ error: "Invalid user id" });
+        }
+        const doc = await wishlistsCollection.findOne({ userId });
+        res.status(200).json({ userId, productIds: doc?.productIds ?? [] });
+      } catch (error) {
+        console.error("Error fetching wishlist:", error);
+        res.status(500).json({ error: "Failed to fetch wishlist" });
+      }
+    })
+
+    app.post('/wishlist/:userId/toggle', async (req, res) => {
+      try {
+        const userId = normalizeUserId(req.params.userId);
+        if (!userId) {
+          return res.status(400).json({ error: "Invalid user id" });
+        }
+        const productId = typeof req.body?.productId === "string" ? req.body.productId.trim() : "";
+        if (!ObjectId.isValid(productId)) {
+          return res.status(400).json({ error: `invalid productId: ${req.body?.productId}` });
+        }
+        const product = await productsCollection.findOne({ _id: new ObjectId(productId) });
+        if (!product) {
+          return res.status(404).json({ error: `Product not found: ${productId}` });
+        }
+        const existing = await wishlistsCollection.findOne({ userId });
+        const current = Array.isArray(existing?.productIds) ? existing.productIds : [];
+        if (current.includes(productId)) {
+          await wishlistsCollection.updateOne(
+            { userId },
+            { $pull: { productIds: productId }, $set: { updatedAt: new Date() } },
+            { upsert: true }
+          );
+          const doc = await wishlistsCollection.findOne({ userId });
+          return res.status(200).json({ userId, productIds: doc?.productIds ?? [], wishlisted: false });
+        }
+        if (current.length >= MAX_WISHLIST_ITEMS) {
+          return res.status(400).json({ error: `wishlist can hold at most ${MAX_WISHLIST_ITEMS} items` });
+        }
+        await wishlistsCollection.updateOne(
+          { userId },
+          {
+            $addToSet: { productIds: productId },
+            $set: { updatedAt: new Date() },
+            $setOnInsert: { createdAt: new Date() },
+          },
+          { upsert: true }
+        );
+        const doc = await wishlistsCollection.findOne({ userId });
+        res.status(200).json({ userId, productIds: doc?.productIds ?? [], wishlisted: true });
+      } catch (error) {
+        console.error("Error toggling wishlist:", error);
+        res.status(500).json({ error: "Failed to update wishlist" });
+      }
+    })
+
+    app.delete('/wishlist/:userId/:productId', async (req, res) => {
+      try {
+        const userId = normalizeUserId(req.params.userId);
+        const productId = typeof req.params.productId === "string" ? req.params.productId.trim() : "";
+        if (!userId) {
+          return res.status(400).json({ error: "Invalid user id" });
+        }
+        if (!ObjectId.isValid(productId)) {
+          return res.status(400).json({ error: `invalid productId: ${req.params.productId}` });
+        }
+        await wishlistsCollection.updateOne(
+          { userId },
+          { $pull: { productIds: productId }, $set: { updatedAt: new Date() } },
+          { upsert: true }
+        );
+        const doc = await wishlistsCollection.findOne({ userId });
+        res.status(200).json({ userId, productIds: doc?.productIds ?? [], wishlisted: false });
+      } catch (error) {
+        console.error("Error removing wishlist item:", error);
+        res.status(500).json({ error: "Failed to update wishlist" });
+      }
+    })
+
+    app.delete('/wishlist/:userId', async (req, res) => {
+      try {
+        const userId = normalizeUserId(req.params.userId);
+        if (!userId) {
+          return res.status(400).json({ error: "Invalid user id" });
+        }
+        await wishlistsCollection.deleteOne({ userId });
+        res.status(200).json({ userId, productIds: [], wishlisted: false });
+      } catch (error) {
+        console.error("Error clearing wishlist:", error);
+        res.status(500).json({ error: "Failed to clear wishlist" });
+      }
+    })
+
+    app.put('/wishlist/:userId', async (req, res) => {
+      try {
+        const userId = normalizeUserId(req.params.userId);
+        if (!userId) {
+          return res.status(400).json({ error: "Invalid user id" });
+        }
+        const { error, value } = validateWishlistIds(req.body?.productIds);
+        if (error) {
+          return res.status(400).json({ error });
+        }
+        await wishlistsCollection.updateOne(
+          { userId },
+          {
+            $set: { productIds: value, updatedAt: new Date() },
+            $setOnInsert: { createdAt: new Date() },
+          },
+          { upsert: true }
+        );
+        res.status(200).json({ userId, productIds: value });
+      } catch (error) {
+        console.error("Error saving wishlist:", error);
+        res.status(500).json({ error: "Failed to save wishlist" });
+      }
+    })
+    
+
+    app.post('/admin/backfill-order-userIds', async (req, res) => {
+      try {
+        const users = await db.collection("user").find(
+          {},
+          { projection: { phone: 1 } }
+        ).toArray();
+        let matchedUsers = 0;
+        let modifiedOrders = 0;
+        for (const user of users) {
+          const userId = String(user._id ?? user.id ?? "");
+          const rawPhone = typeof user.phone === "string" ? user.phone : "";
+          const candidates = [...new Set([rawPhone, rawPhone.trim()].filter(Boolean))];
+          if (!userId || candidates.length === 0) continue;
+          const result = await ordersCollection.updateMany(
+            {
+              $or: [
+                { userId: { $exists: false } },
+                { userId: null },
+              ],
+              "customer.phone": { $in: candidates },
+            },
+            { $set: { userId } }
+          );
+          if (result.matchedCount > 0) matchedUsers += 1;
+          modifiedOrders += result.modifiedCount || 0;
+        }
+        res.status(200).json({ success: true, matchedUsers, modifiedOrders });
+      } catch (error) {
+        console.error("Error backfilling order userIds:", error);
+        res.status(500).json({ error: "Failed to backfill order userIds" });
+      }
+    })
 
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
