@@ -392,7 +392,27 @@ async function run() {
     //Get Products API
     app.get('/products', async (req, res) => {
       try {
-        const products = await productsCollection.find().toArray();
+        const searchText = typeof req.query.search === "string" ? req.query.search.trim() : "";
+        let query = {}
+        if (searchText) {
+          const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          query = {
+            $or: [
+              { name: { $regex: escaped, $options: "i" } },
+              { category: { $regex: escaped, $options: "i" } },
+              {
+                $expr: {
+                  $regexMatch: {
+                    input: { $toString: "$price" },
+                    regex: escaped,
+                    options: "i",
+                  },
+                },
+              },
+            ],
+          };
+        }
+        const products = await productsCollection.find(query).toArray();
         res.status(200).json(products);
       } catch (error) {
         console.error("Error fetching products:", error);
