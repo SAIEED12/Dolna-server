@@ -1,11 +1,13 @@
-const dns = require("node:dns");
+﻿const dns = require("node:dns");
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
+
 
 const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
 dotenv.config();
 const { MongoClient, ServerApiVersion, ObjectId  } = require('mongodb');
+const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
 const uri = process.env.MONGODB_URI;
 const app = express();
 app.use(cors());
@@ -267,6 +269,87 @@ const client = new MongoClient(uri, {
     deprecationErrors: true,
   }
 });
+
+const JWKS = createRemoteJWKSet(new URL(`${process.env.CLIENT_URL}/api/auth/jwks`));
+
+const getBearerToken = (req) => {
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.slice(7).trim();
+  if (!token || token === "null" || token === "undefined") return null;
+  return token;
+};
+
+const normalizeAuthUser = (payload) => {
+  const userId = String(payload?.id ?? payload?.sub ?? "").trim();
+  if (!userId) return null;
+  return {
+    userId,
+    role: typeof payload?.role === "string" && payload.role ? payload.role : "customer",
+    email: typeof payload?.email === "string" ? payload.email : "",
+  };
+};
+
+const verifyToken = async (req, res, next) => {
+  const token = getBearerToken(req);
+  if(!token) {
+     return res.status(401).json({ error: "Missing or invalid Authorization header" });
+  }
+
+  try{
+    const {payload} = await jwtVerify(token, JWKS, {
+      issuer: process.env.CLIENT_URL,
+      audience: process.env.CLIENT_URL,
+    })
+    const user = normalizeAuthUser(payload);
+    if (!user) {
+      return res.status(401).json({ error: "Invalid token payload" });
+    }
+    req.user = user;
+    req.auth = user;
+    return next();
+  }
+  catch(err){
+    console.error("JWT verify failed:", err?.message || err);
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// Optional auth: attaches req.user when a valid JWT is present, otherwise continues as guest.
+// Used for public endpoints (e.g. POST /orders guest COD checkout).
+const optionalAuth = async (req, _res, next) => {
+  const token = getBearerToken(req);
+  if (!token) return next();
+  try {
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: process.env.CLIENT_URL,
+      audience: process.env.CLIENT_URL,
+    });
+    const user = normalizeAuthUser(payload);
+    if (user) {
+      req.user = user;
+      req.auth = user;
+    }
+  } catch {
+    // ignore invalid token on optional route — treated as guest
+  }
+  return next();
+};
+
+const requireAdmin = (req, res, next) => {
+  if (req.user?.role === "admin") return next();
+  return res.status(403).json({ error: "Admin only" });
+};
+
+const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
+  const target = String(getUserId(req) ?? "").trim();
+  if (!target) {
+    return res.status(400).json({ error: "Invalid user id" });
+  }
+  if (req.user?.role === "admin" || target === req.user?.userId) return next();
+  return res.status(403).json({ error: "Forbidden" });
+};
+
 async function run() {
   try {
     await client.connect();
@@ -279,10 +362,9 @@ async function run() {
     await ordersCollection.createIndex({ userId: 1 });
 
     //Add Products API
-    app.post('/add-products', async (req, res) => {
+    app.post('/add-products', verifyToken, async (req, res) => {
       try {
         const product = req.body;
-
         const imagesError = validateImages(product.images);
         if (imagesError) {
           return res.status(400).json({ error: imagesError });
@@ -336,8 +418,8 @@ async function run() {
       }
     })
 
-    //Update Product API
-    app.patch('/products/:id', async (req, res) => {
+    //Update Product API (admin only)
+    app.patch('/products/:id', verifyToken, requireAdmin, async (req, res) => {
       try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -411,8 +493,8 @@ async function run() {
       }
     })
 
-    //Delete Product API
-    app.delete('/products/:id', async (req, res) => {
+    //Delete Product API (admin only)
+    app.delete('/products/:id', verifyToken, requireAdmin, async (req, res) => {
       try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -429,11 +511,19 @@ async function run() {
       }
     })
 
-    //Create Order API
-    app.post('/orders', async (req, res) => {
+    //Create Order API (public for guest COD; links to account when JWT present)
+    app.post('/orders', optionalAuth, async (req, res) => {
       const { error, value } = validateOrder(req.body);
       if (error) {
         return res.status(400).json({ error });
+      }
+      // Strict ownership: an authenticated customer may only create orders for themselves.
+      if (req.user && req.user.role !== "admin") {
+        if (value.userId && value.userId !== req.user.userId) {
+          return res.status(403).json({ error: "Forbidden: userId does not match session" });
+        }
+        // Link authenticated orders to the account even if client omitted userId
+        if (!value.userId) value.userId = req.user.userId;
       }
 
       try {
@@ -518,11 +608,15 @@ async function run() {
       }
     });
 
-    //Get Orders API
-    app.get('/orders', async (req, res) => {
+    //Get Orders API (JWT required; admin sees all, customer sees own userId only)
+    app.get('/orders', verifyToken, async (req, res) => {
       try {
         const filter = {};
         if (req.query.phone) {
+          // Phone filtering is admin-only; customers must scope by their own userId
+          if (req.user.role !== "admin") {
+            return res.status(403).json({ error: "Forbidden" });
+          }
           filter["customer.phone"] = String(req.query.phone).trim();
         }
         if (req.query.userId) {
@@ -530,7 +624,13 @@ async function run() {
           if (!userId) {
             return res.status(400).json({ error: "Invalid user id" });
           }
+          if (req.user.role !== "admin" && userId !== req.user.userId) {
+            return res.status(403).json({ error: "Forbidden" });
+          }
           filter.userId = userId;
+        } else if (req.user.role !== "admin") {
+          // Customers must always scope by userId; bare /orders is admin-only
+          return res.status(403).json({ error: "Forbidden: userId query required" });
         }
         const orders = await ordersCollection.find(filter).sort({ createdAt: -1 }).toArray();
         res.status(200).json(orders);
@@ -540,8 +640,8 @@ async function run() {
       }
     });
 
-    //Update Order API
-    app.patch('/orders/:id', async (req, res) => {
+    //Update Order API (admin only)
+    app.patch('/orders/:id', verifyToken, requireAdmin, async (req, res) => {
       try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -719,8 +819,8 @@ async function run() {
       }
     });
 
-    //Order Details API
-    app.get('/orders/:id', async (req, res) => {
+    //Order Details API (JWT required; admin or order owner)
+    app.get('/orders/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -730,6 +830,9 @@ async function run() {
         if (!result) {
           return res.status(404).json({ error: "Order not found" });
         }
+        if (req.user.role !== "admin" && String(result.userId ?? "") !== req.user.userId) {
+          return res.status(403).json({ error: "Forbidden" });
+        }
         res.status(200).json(result);
       } catch (error) {
         console.error("Error fetching order:", error);
@@ -737,8 +840,8 @@ async function run() {
       }
     })
 
-    //Wishlist APIs 
-    app.get('/wishlist/:userId', async (req, res) => {
+    //Wishlist APIs (JWT required; owner or admin)
+    app.get('/wishlist/:userId', verifyToken, requireOwnerOrAdmin((req) => req.params.userId), async (req, res) => {
       try {
         const userId = normalizeUserId(req.params.userId);
         if (!userId) {
@@ -752,7 +855,7 @@ async function run() {
       }
     })
 
-    app.post('/wishlist/:userId/toggle', async (req, res) => {
+    app.post('/wishlist/:userId/toggle', verifyToken, requireOwnerOrAdmin((req) => req.params.userId), async (req, res) => {
       try {
         const userId = normalizeUserId(req.params.userId);
         if (!userId) {
@@ -797,7 +900,7 @@ async function run() {
       }
     })
 
-    app.delete('/wishlist/:userId/:productId', async (req, res) => {
+    app.delete('/wishlist/:userId/:productId', verifyToken, requireOwnerOrAdmin((req) => req.params.userId), async (req, res) => {
       try {
         const userId = normalizeUserId(req.params.userId);
         const productId = typeof req.params.productId === "string" ? req.params.productId.trim() : "";
@@ -820,7 +923,7 @@ async function run() {
       }
     })
 
-    app.delete('/wishlist/:userId', async (req, res) => {
+    app.delete('/wishlist/:userId', verifyToken, requireOwnerOrAdmin((req) => req.params.userId), async (req, res) => {
       try {
         const userId = normalizeUserId(req.params.userId);
         if (!userId) {
@@ -834,7 +937,7 @@ async function run() {
       }
     })
 
-    app.put('/wishlist/:userId', async (req, res) => {
+    app.put('/wishlist/:userId', verifyToken, requireOwnerOrAdmin((req) => req.params.userId), async (req, res) => {
       try {
         const userId = normalizeUserId(req.params.userId);
         if (!userId) {
@@ -860,7 +963,7 @@ async function run() {
     })
     
 
-    app.post('/admin/backfill-order-userIds', async (req, res) => {
+    app.post('/admin/backfill-order-userIds', verifyToken, requireAdmin, async (req, res) => {
       try {
         const users = await db.collection("user").find(
           {},
