@@ -390,6 +390,9 @@ async function run() {
 
 
     //Get Products API
+    // Supports server-side pagination: pass ?page=&limit= to receive
+    // { products, total, page, limit, totalPages }. Without pagination params
+    // the legacy bare array is returned. Optional ?search= matches name, category, price.
     app.get('/products', async (req, res) => {
       try {
         const searchText = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -412,8 +415,26 @@ async function run() {
             ],
           };
         }
-        const products = await productsCollection.find(query).toArray();
-        res.status(200).json(products);
+        const wantsPagination = req.query.page !== undefined || req.query.limit !== undefined;
+        if (!wantsPagination) {
+          const products = await productsCollection.find(query).sort({ _id: -1 }).toArray();
+          return res.status(200).json(products);
+        }
+        let page = Number.parseInt(Array.isArray(req.query.page) ? req.query.page[0] : req.query.page, 10);
+        let limit = Number.parseInt(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit, 10);
+        if (!Number.isInteger(page) || page < 1) page = 1;
+        if (!Number.isInteger(limit) || limit < 1) limit = 20;
+        limit = Math.min(limit, 100);
+        const total = await productsCollection.countDocuments(query);
+        const totalPages = Math.max(1, Math.ceil(total / limit));
+        if (page > totalPages) page = totalPages;
+        const products = await productsCollection
+          .find(query)
+          .sort({ _id: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray();
+        return res.status(200).json({ products, total, page, limit, totalPages });
       } catch (error) {
         console.error("Error fetching products:", error);
         res.status(500).json({ error: "Failed to fetch products" });
@@ -589,7 +610,6 @@ async function run() {
           deliveryCharge: value.deliveryCharge,
           totalAmount,
           paymentMethod: "cod",
-          // paymentStatus: "unpaid",
           orderStatus: "pending",
           note: value.note,
           createdAt: now,
@@ -652,8 +672,63 @@ async function run() {
           // Customers must always scope by userId; bare /orders is admin-only
           return res.status(403).json({ error: "Forbidden: userId query required" });
         }
-        const orders = await ordersCollection.find(filter).sort({ createdAt: -1 }).toArray();
-        res.status(200).json(orders);
+        const rawStatus = typeof req.query.status === "string" ? req.query.status.trim().toLowerCase() : "";
+        if (rawStatus && rawStatus !== "all") {
+          if (!ORDER_STATUSES.includes(rawStatus)) {
+            return res.status(400).json({ error: `status must be one of: all, ${ORDER_STATUSES.join(", ")}` });
+          }
+          filter.orderStatus = rawStatus;
+        }
+        const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+        if (q) {
+          const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const orClauses = [
+            { "customer.name": { $regex: escaped, $options: "i" } },
+            { "customer.phone": { $regex: escaped, $options: "i" } },
+            { "customer.address": { $regex: escaped, $options: "i" } },
+          ];
+          if (ObjectId.isValid(q)) {
+            orClauses.push({ _id: new ObjectId(q) });
+          }
+          filter.$or = orClauses;
+        }
+        const wantsPagination = req.query.page !== undefined || req.query.limit !== undefined;
+        if (!wantsPagination) {
+          const orders = await ordersCollection.find(filter).sort({ createdAt: -1 }).toArray();
+          return res.status(200).json(orders);
+        }
+        let page = Number.parseInt(Array.isArray(req.query.page) ? req.query.page[0] : req.query.page, 10);
+        let limit = Number.parseInt(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit, 10);
+        if (!Number.isInteger(page) || page < 1) page = 1;
+        if (!Number.isInteger(limit) || limit < 1) limit = 10;
+        limit = Math.min(limit, 100);
+        const total = await ordersCollection.countDocuments(filter);
+        const totalPages = Math.max(1, Math.ceil(total / limit));
+        if (page > totalPages) page = totalPages;
+        const orders = await ordersCollection
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray();
+        const [pendingCount, revenueAgg] = await Promise.all([
+          ordersCollection.countDocuments({ ...filter, orderStatus: "pending" }),
+          ordersCollection
+            .aggregate([
+              { $match: { ...filter, orderStatus: "delivered" } },
+              { $group: { _id: null, revenue: { $sum: "$totalAmount" } } },
+            ])
+            .toArray(),
+        ]);
+        return res.status(200).json({
+          orders,
+          total,
+          page,
+          limit,
+          totalPages,
+          pendingCount,
+          deliveredRevenue: Number(revenueAgg?.[0]?.revenue ?? 0),
+        });
       } catch (error) {
         console.error("Error fetching orders:", error);
         res.status(500).json({ error: "Failed to fetch orders" });
