@@ -640,8 +640,8 @@ async function run() {
       }
     });
 
-    //Update Order API (admin only)
-    app.patch('/orders/:id', verifyToken, requireAdmin, async (req, res) => {
+    //Update Order API (admin full access; customers may only cancel their own pending orders)
+    app.patch('/orders/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -655,6 +655,21 @@ async function run() {
         const existing = await ordersCollection.findOne({ _id: new ObjectId(id) });
         if (!existing) {
           return res.status(404).json({ error: "Order not found" });
+        }
+
+        if (req.user.role !== "admin") {
+          const isOwner = String(existing.userId ?? "") !== "" && String(existing.userId) === req.user.userId;
+          if (!isOwner) {
+            return res.status(403).json({ error: "Forbidden" });
+          }
+          const keys = Object.keys(value);
+          const isSelfCancel = keys.length === 1 && value.orderStatus === "cancelled";
+          if (!isSelfCancel) {
+            return res.status(403).json({ error: "Forbidden" });
+          }
+          if (existing.orderStatus !== "pending") {
+            return res.status(400).json({ error: "Only pending orders can be cancelled" });
+          }
         }
 
         const isFinal = FINAL_ORDER_STATUSES.includes(existing.orderStatus);
