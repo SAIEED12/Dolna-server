@@ -391,33 +391,84 @@ async function run() {
 
     //Get Products API
     // Supports server-side pagination: pass ?page=&limit= to receive
-    // { products, total, page, limit, totalPages }. Without pagination params
-    // the legacy bare array is returned. Optional ?search= matches name, category, price.
-    app.get('/products', async (req, res) => {
-      try {
-        const searchText = typeof req.query.search === "string" ? req.query.search.trim() : "";
-        let query = {}
-        if (searchText) {
-          const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          query = {
-            $or: [
-              { name: { $regex: escaped, $options: "i" } },
-              { category: { $regex: escaped, $options: "i" } },
-              {
-                $expr: {
-                  $regexMatch: {
-                    input: { $toString: "$price" },
-                    regex: escaped,
-                    options: "i",
-                  },
+    // { products, total, page, limit, totalPages, sort, facets }. Without pagination params
+    // the legacy bare array is returned. Optional filters (combinable):
+    // ?search= (name, category, price), ?category= (repeatable), ?minPrice=&maxPrice=,
+    // ?inStock=true, ?sort=newest|price-asc|price-desc|name
+    const PRODUCT_SORTS = {
+      "newest": { _id: -1 },
+      "price-asc": { price: 1, _id: -1 },
+      "price-desc": { price: -1, _id: -1 },
+      "name": { name: 1, _id: -1 },
+    };
+    const parseProductFilter = (req) => {
+      const searchText = typeof req.query.search === "string" ? req.query.search.trim() : "";
+      const baseAnd = [];
+      if (searchText) {
+        const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        baseAnd.push({
+          $or: [
+            { name: { $regex: escaped, $options: "i" } },
+            { category: { $regex: escaped, $options: "i" } },
+            {
+              $expr: {
+                $regexMatch: {
+                  input: { $toString: "$price" },
+                  regex: escaped,
+                  options: "i",
                 },
               },
-            ],
-          };
+            },
+          ],
+        });
+      }
+      const rawCategory = req.query.category;
+      const categoryInputs = Array.isArray(rawCategory) ? rawCategory : (rawCategory !== undefined ? [rawCategory] : []);
+      const categories = [];
+      for (const entry of categoryInputs) {
+        for (const part of String(entry).split(",")) {
+          const name = part.trim();
+          if (name) categories.push(name);
         }
+      }
+      let minPrice = Number(Array.isArray(req.query.minPrice) ? req.query.minPrice[0] : req.query.minPrice);
+      let maxPrice = Number(Array.isArray(req.query.maxPrice) ? req.query.maxPrice[0] : req.query.maxPrice);
+      if (!Number.isFinite(minPrice)) minPrice = null;
+      if (!Number.isFinite(maxPrice)) maxPrice = null;
+      if (minPrice !== null && maxPrice !== null && minPrice > maxPrice) {
+        [minPrice, maxPrice] = [maxPrice, minPrice];
+      }
+      const priceCond = {};
+      if (minPrice !== null) priceCond.$gte = minPrice;
+      if (maxPrice !== null) priceCond.$lte = maxPrice;
+      if (Object.keys(priceCond).length > 0) baseAnd.push({ price: priceCond });
+      const inStock = String(Array.isArray(req.query.inStock) ? req.query.inStock[0] : (req.query.inStock ?? "")).toLowerCase() === "true";
+      if (inStock) baseAnd.push({ stock: { $gt: 0 } });
+      const rawSort = String(Array.isArray(req.query.sort) ? req.query.sort[0] : (req.query.sort ?? "")).trim().toLowerCase();
+      const sortKey = PRODUCT_SORTS[rawSort] ? rawSort : "newest";
+      const andAll = (clauses) => {
+        if (clauses.length === 0) return {};
+        if (clauses.length === 1) return clauses[0];
+        return { $and: clauses };
+      };
+      return {
+        searchText,
+        categories,
+        minPrice,
+        maxPrice,
+        inStock,
+        sortKey,
+        sort: PRODUCT_SORTS[sortKey],
+        query: andAll(categories.length > 0 ? [...baseAnd, { category: { $in: categories } }] : baseAnd),
+        facetQuery: andAll(baseAnd),
+      };
+    };
+    app.get('/products', async (req, res) => {
+      try {
+        const { query, facetQuery, sortKey, sort, categories, minPrice, maxPrice, inStock } = parseProductFilter(req);
         const wantsPagination = req.query.page !== undefined || req.query.limit !== undefined;
         if (!wantsPagination) {
-          const products = await productsCollection.find(query).sort({ _id: -1 }).toArray();
+          const products = await productsCollection.find(query).sort(sort).toArray();
           return res.status(200).json(products);
         }
         let page = Number.parseInt(Array.isArray(req.query.page) ? req.query.page[0] : req.query.page, 10);
@@ -425,16 +476,51 @@ async function run() {
         if (!Number.isInteger(page) || page < 1) page = 1;
         if (!Number.isInteger(limit) || limit < 1) limit = 20;
         limit = Math.min(limit, 100);
-        const total = await productsCollection.countDocuments(query);
+        const [total, facetResult] = await Promise.all([
+          productsCollection.countDocuments(query),
+          productsCollection.aggregate([
+            { $match: facetQuery },
+            {
+              $facet: {
+                categories: [
+                  { $group: { _id: "$category", count: { $sum: 1 } } },
+                  { $sort: { count: -1 } },
+                ],
+                priceBounds: [
+                  { $group: { _id: null, min: { $min: "$price" }, max: { $max: "$price" } } },
+                ],
+              },
+            },
+          ]).toArray(),
+        ]);
         const totalPages = Math.max(1, Math.ceil(total / limit));
         if (page > totalPages) page = totalPages;
         const products = await productsCollection
           .find(query)
-          .sort({ _id: -1 })
+          .sort(sort)
           .skip((page - 1) * limit)
           .limit(limit)
           .toArray();
-        return res.status(200).json({ products, total, page, limit, totalPages });
+        const facets = facetResult?.[0] ?? { categories: [], priceBounds: [] };
+        return res.status(200).json({
+          products,
+          total,
+          page,
+          limit,
+          totalPages,
+          sort: sortKey,
+          appliedFilters: { categories, minPrice, maxPrice, inStock },
+          facets: {
+            categories: (facets.categories ?? []).map((c) => ({
+              name: c._id ?? "Uncategorized",
+              count: c.count ?? 0,
+            })),
+            priceBounds: {
+              min: Number(facets.priceBounds?.[0]?.min ?? 0),
+              max: Number(facets.priceBounds?.[0]?.max ?? 0),
+            },
+          },
+        });
       } catch (error) {
         console.error("Error fetching products:", error);
         res.status(500).json({ error: "Failed to fetch products" });
